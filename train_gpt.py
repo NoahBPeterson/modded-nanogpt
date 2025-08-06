@@ -339,6 +339,9 @@ class CausalSelfAttention(nn.Module):
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
         self.attn_scale = 0.12
+        # ---- Attention sinks: learned per-head logit θ_h. Default init ~e^{-2} mass.
+        self.use_sinks = True
+        self.sink_logit = nn.Parameter(torch.full((num_heads,), -2.0))
 
     def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -350,7 +353,28 @@ class CausalSelfAttention(nn.Module):
             v = lambdas[0] * v + lambdas[1] * ve.view_as(v) # @KoszarskyB & @Grad62304977
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = lambdas[0] * v
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
+        # ---- Append a single sink KV position (value=0). Its score is θ_h via score_mod.
+        if self.use_sinks:
+            sink_idx = T  # the new (T'th) KV position
+            zero_k = torch.zeros(B, 1, self.num_heads, self.head_dim, dtype=k.dtype, device=k.device)
+            zero_v = torch.zeros_like(zero_k)
+            k = torch.cat([k, zero_k], dim=1)
+            v = torch.cat([v, zero_v], dim=1)
+
+            def score_mod(score, b, h, q_idx, kv_idx):
+                # Add θ_h to sink column; no-op elsewhere.
+                return torch.where(kv_idx == sink_idx,
+                                   self.sink_logit[h].to(score.dtype),
+                                   torch.zeros((), dtype=score.dtype, device=score.device)) + score
+
+            y = flex_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                block_mask=block_mask,  # must have KV_LEN = T+1 (see create_blockmasks)
+                score_mod=score_mod,
+                scale=self.attn_scale
+            ).transpose(1, 2)
+        else:
+            y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -419,11 +443,16 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 27.5
         self.scalars.lr_mul = 5.0
 
-    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor, kv_extra: int = 0):
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
 
-        def document_causal(b, h, q_idx, kv_idx):
+        # Allow a special sink token at position len(input_seq) regardless of causal/doc.
+        sink_token_idx = len(input_seq)
+        def document_causal_or_sink(b, h, q_idx, kv_idx):
+            is_sink = kv_idx == sink_token_idx
+            if is_sink:
+                return torch.tensor(True, device="cuda")
             causal_mask = q_idx >= kv_idx
             document_mask = docs[q_idx] == docs[kv_idx]
             return causal_mask & document_mask
@@ -448,14 +477,30 @@ class GPT(nn.Module):
         partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(blockmask_any & ~blockmask_all)
         full_kv_num_blocks, full_kv_indices = dense_to_ordered(blockmask_all)
         def build_bm(window_size_blocks: Tensor) -> BlockMask:
-            return BlockMask.from_kv_blocks(
-                torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
-                partial_kv_indices,
-                torch.clamp_max(full_kv_num_blocks, window_size_blocks - 1),
-                full_kv_indices,
-                BLOCK_SIZE=BLOCK_SIZE,
-                mask_mod=document_causal,
-            )
+            # Optionally add one extra KV block for the sink; we only keep its FIRST token via mask_mod.
+            if kv_extra > 0:
+                # Extend indices arrays to include the new KV block at index NUM_BLOCKS
+                sink_col = torch.full((partial_kv_indices.size(2), 1), NUM_BLOCKS, dtype=torch.int32, device="cuda")
+                partial_idx_ext = torch.cat([partial_kv_indices, sink_col[None, None]], dim=3)
+                full_idx_ext = torch.cat([full_kv_indices, sink_col[None, None]], dim=3)
+                partial_num_ext = torch.clamp_max(
+                    partial_kv_num_blocks + 1,
+                    torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)
+                )
+                full_num_ext = torch.clamp_max(full_kv_num_blocks, window_size_blocks - 1)
+                return BlockMask.from_kv_blocks(
+                    partial_num_ext, partial_idx_ext, full_num_ext, full_idx_ext,
+                    BLOCK_SIZE=BLOCK_SIZE, mask_mod=document_causal_or_sink
+                )
+            else:
+                return BlockMask.from_kv_blocks(
+                    torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(window_size_blocks - full_kv_num_blocks, 1)),
+                    partial_kv_indices,
+                    torch.clamp_max(full_kv_num_blocks, window_size_blocks - 1),
+                    full_kv_indices,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    mask_mod=document_causal_or_sink,
+                )
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
@@ -467,7 +512,8 @@ class GPT(nn.Module):
         ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
-        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
+        # Build masks with one extra KV slot for the attention sink.
+        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks, kv_extra=1)
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
         assert len(block_masks) == len(self.blocks)
 
@@ -735,7 +781,9 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    # Log current sliding-window size (tokens) so it's visible during the run
+    sw_tokens = int(get_window_size_blocks(step).item()) * 128
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms sw:{sw_tokens}", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
