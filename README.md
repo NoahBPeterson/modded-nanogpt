@@ -35,9 +35,13 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 
 To run the current record, run the following commands.
 ```bash
-git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-pip install -r requirements.txt
-pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
+git clone https://github.com/NoahBPeterson/modded-nanogpt.git && cd modded-nanogpt
+# Install uv, a fast python package installer
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.cargo/env
+# Install dependencies
+uv pip install -r requirements.txt
+uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
 # downloads only the first 800M training tokens to save time
 python data/cached_fineweb10B.py 8
 ./run.sh
