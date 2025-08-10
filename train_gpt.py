@@ -450,12 +450,13 @@ class GPT(nn.Module):
         # Allow a special sink token at position len(input_seq) regardless of causal/doc.
         sink_token_idx = len(input_seq)
         def document_causal_or_sink(b, h, q_idx, kv_idx):
+            kv_max = docs.shape[0] - 1
             is_sink = kv_idx == sink_token_idx
-            if is_sink:
-                return torch.tensor(True, device="cuda")
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            return causal_mask & document_mask
+            causal  = q_idx >= kv_idx
+            # Safe index (T-1 when kv_idx == T), keeps everything in-bounds & branchless
+            kv_safe = torch.minimum(kv_idx, kv_max)
+            same_doc = docs[q_idx] == docs[kv_safe]
+            return is_sink | (causal & same_doc)
 
         def dense_to_ordered(dense_blockmask: Tensor):
             num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
